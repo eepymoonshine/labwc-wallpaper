@@ -1,0 +1,321 @@
+#!/usr/bin/python3
+"""Wallpaper setter for labwc: desktop (swaybg) and lock screen (swaylock).
+
+Also implements org.freedesktop.impl.portal.Wallpaper, so apps that use the
+xdg-desktop-portal Wallpaper portal (gThumb's "Set as Desktop Background",
+Loupe, Firefox...) can set them.
+
+  labwc-wallpaper IMAGE [--on desktop|lock|both]   set directly
+  labwc-wallpaper --restore                        (re)start swaybg on login
+  labwc-wallpaper --portal                         run the portal backend (D-Bus activated)
+
+The current images live in ~/.local/share/labwc-wallpaper/{desktop,lockscreen};
+swaylock's config points at the lockscreen copy, so it only has to be replaced.
+"""
+
+import argparse
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+import gi
+
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf, Gio, GLib  # noqa: E402
+
+STATE_DIR = os.path.join(GLib.get_user_data_dir(), "labwc-wallpaper")
+DESKTOP = os.path.join(STATE_DIR, "desktop")
+LOCKSCREEN = os.path.join(STATE_DIR, "lockscreen")
+SWAYBG_MODE = "fill"
+
+BUS_NAME = "org.freedesktop.impl.portal.desktop.labwcwallpaper"
+OBJ_PATH = "/org/freedesktop/portal/desktop"
+
+# Portal responses
+OK, CANCELLED, FAILED = 0, 1, 2
+
+
+# ---------------------------------------------------------------- applying
+
+def _install_image(src_bytes, dest):
+    """Write the image to dest atomically, baking in EXIF rotation (swaybg/swaylock ignore it)."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    loader = GdkPixbuf.PixbufLoader()
+    loader.write(src_bytes)
+    loader.close()  # raises GLib.Error if it's not an image
+    pixbuf = loader.get_pixbuf()
+    orientation = pixbuf.get_option("orientation")
+
+    fd, tmp = tempfile.mkstemp(dir=STATE_DIR, prefix=".tmp-")
+    try:
+        if orientation and orientation != "1":
+            os.close(fd)
+            pixbuf.apply_embedded_orientation().savev(tmp, "png", [], [])
+        else:
+            with os.fdopen(fd, "wb") as f:
+                f.write(src_bytes)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dest)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def _swaybg_pids():
+    out = subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", "swaybg"],
+                         capture_output=True, text=True).stdout
+    return [int(p) for p in out.split()]
+
+
+def restart_swaybg():
+    """Start a new swaybg on top of the old one, then drop the old one (no black flash)."""
+    old = _swaybg_pids()
+    cmd = ["swaybg", "-i", DESKTOP, "-m", SWAYBG_MODE]
+    # Own scope, so it outlives this process / the portal service's cgroup.
+    if shutil.which("systemd-run"):
+        cmd = ["systemd-run", "--user", "--scope", "--quiet", "--collect"] + cmd
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    # In the long-running portal, reap swaybg when it's later replaced (no zombies).
+    # Harmless in CLI mode: the process exits and swaybg is reparented.
+    GLib.child_watch_add(GLib.PRIORITY_DEFAULT, proc.pid, lambda *_: None)
+    if old:
+        time.sleep(0.6)
+        for pid in old:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+
+def apply(data, on):
+    """on: 'background' | 'lockscreen' | 'both'"""
+    if on in ("background", "both"):
+        _install_image(data, DESKTOP)
+    if on in ("lockscreen", "both"):
+        _install_image(data, LOCKSCREEN)
+    if on in ("background", "both"):
+        restart_swaybg()
+
+
+# ---------------------------------------------------------------- preview dialog
+
+def preview_dialog(data, set_on, parent_window, done):
+    """Show the picture and let the user pick where it goes. Calls done(response, set_on)."""
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gdk, Gtk
+
+    Gtk.init()
+    texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(data))
+
+    win = Gtk.Window(title="Set Background", modal=True, default_width=640, default_height=470)
+    header = Gtk.HeaderBar(show_title_buttons=False)
+    cancel = Gtk.Button(label="Cancel")
+    ok = Gtk.Button(label="Set")
+    ok.add_css_class("suggested-action")
+    header.pack_start(cancel)
+    header.pack_end(ok)
+    win.set_titlebar(header)
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                  margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+    picture = Gtk.Picture(paintable=texture, content_fit=Gtk.ContentFit.COVER,
+                          vexpand=True, hexpand=True)
+    picture.add_css_class("card")
+    frame = Gtk.AspectFrame(ratio=16 / 10, obey_child=False, child=picture, vexpand=True)
+    # Match the real screen's shape if we can.
+    monitors = Gdk.Display.get_default().get_monitors()
+    if monitors.get_n_items():
+        geo = monitors.get_item(0).get_geometry()
+        if geo.height:
+            frame.set_ratio(geo.width / geo.height)
+    box.append(frame)
+
+    choices = Gtk.Box(css_classes=["linked"], halign=Gtk.Align.CENTER)
+    buttons = {}
+    first = None
+    for key, label in (("background", "Desktop"), ("lockscreen", "Lock Screen"), ("both", "Both")):
+        b = Gtk.ToggleButton(label=label, group=first)
+        first = first or b
+        buttons[key] = b
+        choices.append(b)
+    buttons.get(set_on, buttons["both"]).set_active(True)
+    box.append(choices)
+    win.set_child(box)
+
+    finished = False
+
+    def finish(response):
+        nonlocal finished
+        if finished:
+            return
+        finished = True
+        chosen = next(k for k, b in buttons.items() if b.get_active())
+        win.destroy()
+        done(response, chosen)
+
+    cancel.connect("clicked", lambda *_: finish(CANCELLED))
+    ok.connect("clicked", lambda *_: finish(OK))
+    def on_close_request(_w):
+        finish(CANCELLED)
+        return True
+
+    def on_key(_ctl, keyval, _code, _state):
+        if keyval == Gdk.KEY_Escape:
+            finish(CANCELLED)
+            return True
+        return False
+
+    win.connect("close-request", on_close_request)
+    keys = Gtk.EventControllerKey()
+    keys.connect("key-pressed", on_key)
+    win.add_controller(keys)
+
+    # Attach to the requesting app's window when the compositor supports xdg-foreign.
+    if parent_window.startswith("wayland:"):
+        def on_realize(w):
+            try:
+                gi.require_version("GdkWayland", "4.0")
+                from gi.repository import GdkWayland
+                surface = w.get_surface()
+                if isinstance(surface, GdkWayland.WaylandToplevel):
+                    surface.set_transient_for_exported(parent_window[len("wayland:"):])
+            except Exception:
+                pass
+        win.connect("realize", on_realize)
+
+    win.present()
+    return lambda: finish(CANCELLED)
+
+
+# ---------------------------------------------------------------- portal backend
+
+INTROSPECTION = """
+<node>
+  <interface name="org.freedesktop.impl.portal.Wallpaper">
+    <method name="SetWallpaperURI">
+      <arg type="o" name="handle" direction="in"/>
+      <arg type="s" name="app_id" direction="in"/>
+      <arg type="s" name="parent_window" direction="in"/>
+      <arg type="s" name="uri" direction="in"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="u" name="response" direction="out"/>
+    </method>
+    <property name="version" type="u" access="read"/>
+  </interface>
+</node>"""
+
+REQUEST_XML = """
+<node>
+  <interface name="org.freedesktop.impl.portal.Request">
+    <method name="Close"/>
+  </interface>
+</node>"""
+
+
+def log(*a):
+    print("labwc-wallpaper:", *a, file=sys.stderr, flush=True)
+
+
+def run_portal():
+    loop = GLib.MainLoop()
+    wall_iface = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION).interfaces[0]
+    req_iface = Gio.DBusNodeInfo.new_for_xml(REQUEST_XML).interfaces[0]
+
+    def set_wallpaper(conn, invocation, handle, app_id, parent_window, uri, options):
+        set_on = options.get("set-on", "both")
+        if set_on not in ("background", "lockscreen", "both"):
+            set_on = "both"
+        log(f"{app_id or 'host app'} wants {uri} on {set_on}")
+
+        try:
+            data = Gio.File.new_for_uri(uri).load_contents(None)[1]
+        except GLib.Error as e:
+            log("cannot read", uri, e.message)
+            invocation.return_value(GLib.Variant("(u)", (FAILED,)))
+            return
+
+        reg_id = None
+
+        def reply(response, where):
+            nonlocal reg_id
+            if reg_id is not None:
+                conn.unregister_object(reg_id)
+                reg_id = None
+            if response == OK:
+                try:
+                    apply(data, where)
+                except Exception as e:  # bad image, disk error, ...
+                    log("failed:", e)
+                    response = FAILED
+            invocation.return_value(GLib.Variant("(u)", (response,)))
+
+        if not options.get("show-preview", False):
+            reply(OK, set_on)
+            return
+
+        try:
+            close = preview_dialog(data, set_on, parent_window, reply)
+        except Exception as e:
+            log("preview failed:", e)
+            invocation.return_value(GLib.Variant("(u)", (FAILED,)))
+            return
+
+        def on_request_call(_c, _s, _p, _i, method, _params, inv):
+            inv.return_value(None)
+            close()
+
+        try:
+            reg_id = conn.register_object(handle, req_iface, on_request_call, None, None)
+        except GLib.Error:
+            reg_id = None
+
+    def on_call(conn, sender, path, iface, method, params, invocation):
+        if method == "SetWallpaperURI":
+            set_wallpaper(conn, invocation, *params.unpack())
+        else:
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method)
+
+    def on_get_property(conn, sender, path, iface, prop):
+        return GLib.Variant("u", 1) if prop == "version" else None
+
+    def on_bus(conn, _name):
+        conn.register_object(OBJ_PATH, wall_iface, on_call, on_get_property, None)
+
+    Gio.bus_own_name(Gio.BusType.SESSION, BUS_NAME, Gio.BusNameOwnerFlags.NONE,
+                     on_bus, None, lambda *_: loop.quit())
+    loop.run()
+
+
+# ---------------------------------------------------------------- CLI
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("image", nargs="?")
+    p.add_argument("--on", choices=["desktop", "lock", "both"], default="both")
+    p.add_argument("--portal", action="store_true", help="run as the xdg-desktop-portal backend")
+    p.add_argument("--restore", action="store_true", help="start swaybg with the saved desktop image")
+    args = p.parse_args()
+
+    if args.portal:
+        run_portal()
+    elif args.restore:
+        if os.path.exists(DESKTOP):
+            restart_swaybg()
+    elif args.image:
+        with open(args.image, "rb") as f:
+            data = f.read()
+        apply(data, {"desktop": "background", "lock": "lockscreen", "both": "both"}[args.on])
+    else:
+        p.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
