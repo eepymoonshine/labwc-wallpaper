@@ -47,3 +47,7 @@ labwc-wallpaper photo.jpg --on lock
 ```
 
 The first time an app sets the wallpaper, xdg-desktop-portal asks once whether to allow it.
+
+## License
+
+[MIT](LICENSE)
